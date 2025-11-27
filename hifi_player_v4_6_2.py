@@ -348,7 +348,23 @@ def filesize_bytes_aiff_as_wav(directory, filename):
             return os.path.getsize(full_path)
     except Exception:
         return None
-
+    
+def filesize_bytes_m4a_as_wav(directory, filename):
+    """Calculate expected WAV file size for M4A/AAC conversion"""
+    try:
+        full_path = os.path.join(directory, filename)
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in ('.m4a', '.aac'):
+            with sf.SoundFile(full_path, 'r') as af:
+                nch = af.channels
+                nf = af.frames
+                # M4A/AAC typically converts to 16-bit PCM WAV
+                out_sw = 2  # 16-bit = 2 bytes
+                return 44 + (nf * nch * out_sw)
+        else:
+            return os.path.getsize(full_path)
+    except Exception:
+        return None
 # =====================================================================
 # SECTION 5: SOAP/UPnP Functions (v4.6.1 + v4.6.2 multi-format logic)
 # =====================================================================
@@ -457,27 +473,21 @@ def set_avtransport_uri_variants(avtransport_url, url, filename, directory, actu
 
     time.sleep(0.8)
 
-    sz = filesize_bytes_aiff_as_wav(directory, actual_filename)
-    ext = os.path.splitext(filename)[1].lower()
+    ext = os.path.splitext(actual_filename)[1].lower()
+    if ext in ('.m4a', '.aac'):
+        sz = filesize_bytes_m4a_as_wav(directory, actual_filename)
+    else:
+        sz = filesize_bytes_aiff_as_wav(directory, actual_filename)
+
     format_type = get_format_from_extension(filename)
     
+    
     attempts = []
-    #attempts.append(('empty', ''))
-    for i, (label, meta) in enumerate(attempts, 1):
-        if debug:
-            print(f"[SetAVTransportURI] Attempt {i}/{len(attempts)}: {label}")
-        
-        # SAFETY CHECK: Skip empty metadata (v4.6.2.1 FIX)
-        if not meta:
-            if debug:
-                print(f"[SetAVTransportURI] ⚠ Skipping empty metadata")
-            continue
-        
-        ok = set_avtransport_uri(avtransport_url, url, meta, debug=debug)
+    
     # For MP3, M4A, FLAC, DSF: use format-specific variants (v4.6.2 ENHANCED)
     if format_type in ('mp3', 'm4a', 'flac', 'dsf'):
         filesize = get_file_size(os.path.join(directory, actual_filename))
-        metadata_dict = extract_metadata(os.path.join(directory, actual_filename)) if AUDIO_FORMAT_CONFIG.get(format_type, {}).get('requires_metadata_extraction', False) else None
+        metadata_dict = extract_metadata(os.path.join(directory, actual_filename)) if AUDIO_FORMAT_CONFIG. get(format_type, {}).get('requires_metadata_extraction', False) else None
         
         # Add format-specific DIDL variants
         protocol_variants = AUDIO_FORMAT_CONFIG.get(format_type, {}).get('protocol_info_variants', [])
@@ -498,6 +508,7 @@ def set_avtransport_uri_variants(avtransport_url, url, filename, directory, actu
         base_mime = 'audio/mpeg' if ext == '.mp3' else 'application/octet-stream'
         attempts.append(('didl_min_generic', build_didl_with_size(url, filename, minimal_protocol_info(base_mime), sz)))
 
+    # NOW try all attempts
     for i, (label, meta) in enumerate(attempts, 1):
         if debug:
             print(f"[SetAVTransportURI] Attempt {i}/{len(attempts)}: {label} (format={format_type})")
@@ -505,7 +516,7 @@ def set_avtransport_uri_variants(avtransport_url, url, filename, directory, actu
         ok = set_avtransport_uri(avtransport_url, url, meta, debug=debug)
         if ok:
             if debug:
-                print(f"[SetAVTransportURI] âœ“ Success with variant: {label}")
+                print(f"[SetAVTransportURI] ✓ Success with variant: {label}")
             return True
         
         time.sleep(1.0)
@@ -689,11 +700,11 @@ class CommandWorkerThread(threading.Thread):
         })
 
         ext = os.path.splitext(filename)[1].lower()
-        if ext in ('.aif', '.aiff'):
+        if ext in ('.aif', '.aiff', '.m4a', '.aac'):
             wav_name = os.path.splitext(filename)[0] + '.wav'
-            file_url = f"http://{self.advertise_host}:{self.port}/{urllib.parse.quote(wav_name)}"
+            file_url = f"http://{self.advertise_host}:{self.port}/{urllib. parse.quote(wav_name)}"
         else:
-            file_url = f"http://{self.advertise_host}:{self.port}/{urllib.parse.quote(filename)}"
+            file_url = f"http://{self.advertise_host}:{self.port}/{urllib.parse. quote(filename)}"
 
         stop_upnp(self.control_url, debug=self.debug)
         time.sleep(0.3)
@@ -701,7 +712,7 @@ class CommandWorkerThread(threading.Thread):
         ok = set_avtransport_uri_variants(
             self.control_url,
             file_url,
-            wav_name if ext in ('.aif', '.aiff') else filename,
+            wav_name if ext in ('.aif', '.aiff', '.m4a', '.aac') else filename,
             self.directory,
             filename,
             debug=self.debug
@@ -732,12 +743,15 @@ class CommandWorkerThread(threading.Thread):
             print(f"[CommandWorker] âœ— Pause failed")
 
     def _handle_stop(self, cmd):
+        # First try to pause, then stop (more reliable for M4A/AAC)
+        ok = pause_upnp(self.control_url, debug=self.debug)
+        time.sleep(0.2)
         ok = stop_upnp(self.control_url, debug=self.debug)
         if ok:
             SHARED_STATE.update({'is_playing': False, 'transport_state': 'STOPPED'})
-            print(f"[CommandWorker] âœ“ Stopped")
+            print(f"[CommandWorker] ✓ Stopped")
         else:
-            print(f"[CommandWorker] âœ— Stop failed")
+            print(f"[CommandWorker] ✗ Stop failed")
 
     def _handle_next(self, cmd):
         current = SHARED_STATE.get('current_track_idx')
@@ -815,7 +829,7 @@ class StaticAudioHandler(http.server.SimpleHTTPRequestHandler):
                             datasize = nframes * nch * sampwidth
                             totalsize = 44 + datasize
                             
-                            header = self.wav_header_bytes(nch, sampwidth, samplerate, nframes)
+                            header = self._wav_header_bytes(nch, sampwidth, samplerate, nframes)
                             
                             self.send_response(200)
                             self.send_header('Content-Type', 'audio/wav')
@@ -855,7 +869,64 @@ class StaticAudioHandler(http.server.SimpleHTTPRequestHandler):
                             except:
                                 pass
                             return
+                        
+            # Try M4A/AAC fallback for . wav requests
+            possible_m4a = fullpath[:-4] + '. m4a'
+            possible_aac = fullpath[:-4] + '.aac'
             
+            for candidate in [possible_m4a, possible_aac]:
+                if os.path.exists(candidate):
+                    try:
+                        # Stream M4A/AAC as WAV
+                        info = sf.info(candidate)
+                        samplerate = info.samplerate
+                        nch = info.channels
+                        nframes = info.frames
+                        sampwidth = 2  # 16-bit PCM
+                        datasize = nframes * nch * sampwidth
+                        totalsize = 44 + datasize
+                        
+                        header = self._wav_header_bytes(nch, sampwidth, samplerate, nframes)
+                        
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'audio/wav')
+                        self.send_header('Content-Length', str(totalsize))
+                        self. send_header('Accept-Ranges', 'bytes')
+                        self.end_headers()
+                        
+                        self.wfile.write(header)
+                        
+                        CHUNKSIZE = 65536
+                        with sf.SoundFile(candidate, 'r') as f:
+                            while True:
+                                try:
+                                    data = f.read(CHUNKSIZE, dtype='int16')
+                                    if data. size == 0:
+                                        break
+                                    self. wfile.write(data. tobytes())
+                                    self.wfile.flush()
+                                except (BrokenPipeError, ConnectionResetError):
+                                    if hasattr(self.server, 'debug') and self.server.debug:
+                                        print(f"[HTTP] Client disconnected")
+                                    break
+                                except Exception as e:
+                                    if hasattr(self.server, 'debug') and self. server.debug:
+                                        print(f"[HTTP] Streaming error: {e}")
+                                    break
+                        
+                        if hasattr(self.server, 'debug') and self.server. debug:
+                            print(f"[HTTP] ✓ Streamed M4A/AAC→WAV")
+                        return
+                    except BrokenPipeError:
+                        return
+                    except Exception as e:
+                        print(f"[HTTP] Error: {e}")
+                        try:
+                            self.send_error(500)
+                        except:
+                            pass
+                        return
+                    
             # File not found
             if hasattr(self.server, 'debug') and self.server.debug:
                 print(f"[HTTP] âœ— 404: {fullpath}")
@@ -1107,24 +1178,24 @@ def interactive_ui(files, polling_thread, command_worker, debug=False):
         choice = input("\nCommand: ").strip().lower()
 
         if choice == 'q':
-    if state['is_playing']:
-        print("\n[Quit] Stopping playback before exit...")
-        SHARED_STATE.set('play_all_enabled', False)
-        COMMAND_QUEUE.put(Command(CommandType.STOP))
-        
-        # ✅ FIXED: Wait for playback to actually stop
-        timeout = 5  # Max 5 seconds to wait
-        start = time.time()
-        while SHARED_STATE.get('is_playing') and (time.time() - start) < timeout:
-            time.sleep(0.1)
-        
-        if SHARED_STATE.get('is_playing'):
-            print("[Quit] Warning: Playback did not stop in time, continuing shutdown...")
-        else:
-            print("[Quit] Playback stopped successfully")
+            if state['is_playing']:
+                print("\n[Quit] Stopping playback before exit...")
+                SHARED_STATE.set('play_all_enabled', False)
+                COMMAND_QUEUE.put(Command(CommandType.STOP))
+                
+                # ✅ FIXED: Wait for playback to actually stop
+                timeout = 5  # Max 5 seconds to wait
+                start = time.time()
+                while SHARED_STATE.get('is_playing') and (time.time() - start) < timeout:
+                    time.sleep(0.1)
+                
+                if SHARED_STATE.get('is_playing'):
+                    print("[Quit] Warning: Playback did not stop in time, continuing shutdown...")
+                else:
+                    print("[Quit] Playback stopped successfully")
 
-    COMMAND_QUEUE.put(Command(CommandType.QUIT))
-    break
+            COMMAND_QUEUE.put(Command(CommandType.QUIT))
+            break
 
         elif choice == 'a':
             try:
