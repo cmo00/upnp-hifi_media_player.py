@@ -1107,14 +1107,24 @@ def interactive_ui(files, polling_thread, command_worker, debug=False):
         choice = input("\nCommand: ").strip().lower()
 
         if choice == 'q':
-            if state['is_playing']:
-                print("\n[Quit] Stopping playback before exit...")
-                SHARED_STATE.set('play_all_enabled', False)
-                COMMAND_QUEUE.put(Command(CommandType.STOP))
-                time.sleep(0.5)
+    if state['is_playing']:
+        print("\n[Quit] Stopping playback before exit...")
+        SHARED_STATE.set('play_all_enabled', False)
+        COMMAND_QUEUE.put(Command(CommandType.STOP))
+        
+        # ✅ FIXED: Wait for playback to actually stop
+        timeout = 5  # Max 5 seconds to wait
+        start = time.time()
+        while SHARED_STATE.get('is_playing') and (time.time() - start) < timeout:
+            time.sleep(0.1)
+        
+        if SHARED_STATE.get('is_playing'):
+            print("[Quit] Warning: Playback did not stop in time, continuing shutdown...")
+        else:
+            print("[Quit] Playback stopped successfully")
 
-            COMMAND_QUEUE.put(Command(CommandType.QUIT))
-            break
+    COMMAND_QUEUE.put(Command(CommandType.QUIT))
+    break
 
         elif choice == 'a':
             try:
