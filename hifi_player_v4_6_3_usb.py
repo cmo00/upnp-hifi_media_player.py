@@ -219,7 +219,7 @@ class USBPlaybackEngine:
         self.debug = debug
         
         # Scan audio files
-        self.files = self._list_audio_files()
+        self.files = list_audio_files(self.audio_dir)
         if not self.files:
             raise ValueError(f"No audio files found in {audio_dir}")
         
@@ -247,21 +247,7 @@ class USBPlaybackEngine:
         
         # Lock for thread-safe state updates
         self.state_lock = threading.RLock()
-    
-    def _list_audio_files(self):
-        """List all supported audio files in directory"""
-        supported_exts = {'.wav', '.aiff', '.aif', '.flac', '.mp3', '.m4a', '.aac', '.dsf'}
         
-        files = []
-        try:
-            for f in sorted(os.listdir(self.audio_dir)):
-                if os.path.splitext(f)[1].lower() in supported_exts:
-                    files.append(f)
-        except Exception as e:
-            if self.debug:
-                print(f"[USBEngine] Error listing files: {e}")
-        
-        return files
     
     def start(self):
         """Start all 3 threads"""
@@ -347,7 +333,10 @@ class USBPlaybackEngine:
                 return
             
             filename = self.files[track_idx]
-            filepath = os.path.join(self.audio_dir, filename)
+            filepath = os.path.abspath(os.path.join(self.audio_dir, filename))
+            print(f"[USBEngine-PB] ABSOLUTE PATH: {filepath}")  # Debug!
+            print(f"[USBEngine-PB] EXISTS: {os.path.exists(filepath)}")
+            print(f"[USBEngine-PB] SIZE: {os.path.getsize(filepath)} bytes")
             
             # Stop any existing playback
             self._do_stop()
@@ -452,163 +441,102 @@ class USBPlaybackEngine:
             self._do_play(start_idx)
             
     def _playback_worker(self, filepath, track_idx):
-        """
-        Thread 2: Stream PCM data to USB DAC.
-        
-        This is a long-running thread that:
-        - Reads audio file
-        - Plays to USB DAC
-        - Monitors for stop/pause events
-        - Detects track end
-        - Triggers auto-next for Play All
-        """
         if self.debug:
             print(f"[USBEngine-PB] Worker started for track {track_idx}: {os.path.basename(filepath)}")
         
         try:
-            
+            # Device check
             devices = sd.query_devices()
             if self.device_idx < 0 or self.device_idx >= len(devices):
-                print(f"[USBEngine-PB] âœ— Device {self.device_idx} not available")
+                print(f"[USBEngine-PB] ❌ Device {self.device_idx} not available")
                 with self.state_lock:
                     self.is_playing = False
                     self.transport_state = 'STOPPED'
                 return
+            
+            # === SSD-FIX v4.6.5 ===
+            filepath = os.path.abspath(filepath)
+            print(f"[SSD-FIX] Testing: {filepath}")
+            print(f"[SSD-FIX] EXISTS: {os.path.exists(filepath)}")
+            print(f"[SSD-FIX] SIZE: {os.path.getsize(filepath) if os.path.exists(filepath) else 'FAIL'}")
+            
+            # Audio loading mit 3-Stufen-Fallback
             try:
-                # Try soundfile first (WAV, FLAC, DSF, AIFF)
+                # 1. soundfile (AIFF/DSF/FLAC/WAV)
+                info = sf.info(filepath)
+                print(f"[SSD-FIX] soundfile INFO: {info.samplerate}Hz {info.channels}ch {info.frames} frames")
                 data, sr = sf.read(filepath, dtype='float32')
-                if self.debug:
-                    print(f"[USBEngine-PB] Read with soundfile")
-            
+                print(f"[USBEngine-PB] ✅ soundfile OK: {sr}Hz {len(data)/sr:.1f}s")
+                
             except Exception as sf_error:
-                # soundfile failed - try librosa for M4A/AAC/MP3
-                if filepath.lower().endswith(('.m4a', '.aac', '.mp3')):
-                    try:
-                        import librosa
-                        if self.debug:
-                            print(f"[USBEngine-PB] soundfile failed, trying librosa")
-                        
-                        data, sr = librosa.load(filepath, sr=None, mono=False, dtype='float32')
-                        if len(data.shape) == 1:
-                            data = data.reshape(1, -1)  # Convert mono to (1, samples)
-                        if data.shape[0] > 2:
-                            data = data[:2, :]  # Limit to max 2 channels
-                        if self.debug:
-                            print(f"[USBEngine-PB] Read with librosa")
+                print(f"[USBEngine-PB] ❌ soundfile FAIL: {sf_error}")
+                
+                # 2. pydub Fallback (MP3/M4A/SSD)
+                try:
+                    from pydub import AudioSegment
+                    audio = AudioSegment.from_file(filepath)
+                    data = np.array(audio.get_array_of_samples(), dtype=np.float32) / 32768.0
+                    if len(data.shape) == 1:
+                        data = data.reshape(1, -1)
+                    sr = audio.frame_rate
+                    print(f"[PYDUB] ✅ Fallback OK: {sr}Hz {len(data)/sr:.1f}s")
                     
-                    except ImportError:
-                        print(f"[USBEngine-PB] âœ— librosa not installed: pip install librosa")
-                        with self.state_lock:
-                            self.is_playing = False
-                            self.transport_state = 'STOPPED'
-                        return
-                    
-                    except Exception as e:
-                        print(f"[USBEngine-PB] âœ— librosa error: {e}")
-                        with self.state_lock:
-                            self.is_playing = False
-                            self.transport_state = 'STOPPED'
-                        return
-                else:
-                    print(f"[USBEngine-PB] âœ— soundfile error: {sf_error}")
-                    with self.state_lock:
-                        self.is_playing = False
-                        self.transport_state = 'STOPPED'
-                    return
+                except:
+                    # 3. librosa (letzter Ausweg)
+                    import librosa
+                    data, sr = librosa.load(filepath, sr=None, mono=False, dtype='float32')
+                    if len(data.shape) == 1:
+                        data = data.reshape(1, -1)
+                    if data.shape[0] > 2:
+                        data = data[:2, :]
+                    print(f"[LIBROSA] ✅ Fallback OK: {sr}Hz")
             
+            # State update
             with self.state_lock:
                 self.track_duration = len(data) / sr
-                if self.debug:
-                    channels = 1 if len(data.shape) == 1 else data.shape[1]
-                    print(f"[USBEngine-PB] Format: {sr}Hz, {channels}ch, {self.track_duration:.1f}s")
-                    
+                channels = 1 if len(data.shape) == 1 else data.shape[1]
+                self.is_playing = True
+                self.transport_state = 'PLAYING'
+                self.track_start_time = time.time()
+                self.track_start_position = 0.0
+                self.current_position = 0.0
             
-            
-            device_info = devices[self.device_idx]
             if self.debug:
-                print(f"[USBEngine-PB] Device: {device_info['name']}")
+                print(f"[USBEngine-PB] Format: {sr}Hz, {channels}ch, {self.track_duration:.1f}s")
+                print(f"[USBEngine-PB] Device: {devices[self.device_idx]['name']}")
             
-            # Set device and play
+            # PLAYBACK (CRITICAL!)
             sd.default.device = self.device_idx
-            
-            if self.debug:
-                print(f"[USBEngine-PB] Starting playback at {sr}Hz")
-            
             sd.play(data, samplerate=sr, device=self.device_idx)
             
+            if self.debug:
+                print(f"[USBEngine-PB] ▶ Starting playback at {sr}Hz")
             
-            last_is_playing = True
+            # Block bis Ende/Stop (sd.wait() intern!)
+            while sd.get_stream().active and not self.stop_event.is_set():
+                time.sleep(0.05)  # Position update alle 50ms
             
-            duration = len(data) / sr
-            starttime = time.time()
-            while time.time() - starttime < duration and not self.stopevent.isset():
-                # Update position and check for pause/stop
-                elapsed = time.time() - starttime
-                self.currentposition = self.trackstartposition + elapsed
-                # Update position
-                with self.state_lock:
-                    if self.track_start_time:
-                        elapsed = time.time() - self.track_start_time
-                        self.current_position = self.track_start_position + elapsed
-                    
-                    # Handle pause
-                    if self.pauseevent.is_set() and self.transport_state == 'PLAYING':
-                        sd.stop()
-                        self.transport_state = 'PAUSED'
-                        last_is_playing = False
-                    
-                    elif not self.pauseevent.is_set() and not last_is_playing:
-                        # Resume from pause
-                        remaining_data = data[int(self.current_position * sr):]
-                        if len(remaining_data) > 0:
-                            sd.play(remaining_data, samplerate=sr, device=self.device_idx)
-                            self.track_start_time = time.time()
-                            self.track_start_position = self.current_position
-                            self.transport_state = 'PLAYING'
-                            last_is_playing = True
-                
-                time.sleep(0.05)  # Check every 50ms for responsiveness
+            # Cleanup
+            sd.stop()
             
-            
-            
-            with self.state_lock:
-                if self.stopevent.is_set():
-                    sd.stop()
-                    if self.debug:
-                        print(f"[USBEngine-PB] Stopped by command")
-                    self.is_playing = False
-                    self.transport_state = 'STOPPED'
-                
-                else:
-                    # Playback finished naturally
-                    if self.debug:
-                        print(f"[USBEngine-PB] âœ“ Playback finished")
-                    
-                    self.is_playing = False
-                    self.transport_state = 'STOPPED'
-                    self.current_position = self.track_duration
-                    
-                    # Auto-next if Play All enabled
-                    if self.play_all_enabled and track_idx < len(self.files) - 1:
-                        if self.debug:
-                            print(f"[USBEngine-PB] Auto-next to track {track_idx + 2}")
-                        
-                        # Enqueue next track
-                        self.command_queue.put({
-                            'type': USBCommandType.PLAY,
-                            'track_idx': track_idx + 1
-                        })
-                    else:
-                        # Play All finished or single track ended
-                        if self.play_all_enabled:
-                            print(f"[USBEngine-PB] Play All finished")
-                            self.play_all_enabled = False
-        
-        except Exception as e:
-            print(f"[USBEngine-PB] âœ— Playback worker error: {e}")
             with self.state_lock:
                 self.is_playing = False
                 self.transport_state = 'STOPPED'
+                self.current_position = self.track_duration
+            
+            if self.debug:
+                print(f"[USBEngine-PB] ✅ Playback finished")
+            
+            # Auto-Next
+            if self.play_all_enabled and track_idx < len(self.files) - 1:
+                self.command_queue.put({'type': USBCommandType.PLAY, 'track_idx': track_idx + 1})
+        
+        except Exception as e:
+            print(f"[USBEngine-PB] ❌ Playback worker error: {e}")
+            with self.state_lock:
+                self.is_playing = False
+                self.transport_state = 'STOPPED'
+
     
     
     def _status_poller_loop(self):
@@ -742,7 +670,7 @@ class SharedState:
             'track_started': False,
             'track_start_time': 0,
             # USB-specific state
-            'playback_mode': PlaybackMode. UPNP_NETWORK,
+            'playback_mode': PlaybackMode.UPNP_NETWORK,
             'usb_device_index': None,
             'usb_device_name': '',
         }
@@ -1798,7 +1726,7 @@ class StaticAudioHandler(http.server.SimpleHTTPRequestHandler):
                             datasize = nframes * nch * sampwidth
                             totalsize = 44 + datasize
                             
-                            header = self.wav_header_bytes(nch, sampwidth, samplerate, nframes)
+                            header = self._wav_header_bytes(nch, sampwidth, samplerate, nframes)
                             
                             self.send_response(200)
                             self.send_header('Content-Type', 'audio/wav')
@@ -2067,19 +1995,23 @@ def get_lan_advertise_ip(fallback='127.0.0.1'):
     except Exception:
         return fallback
 
-def list_audio_files(directory):
-    audio_ext = ('.wav', '.flac', '.aac', '.mp3', '.m4a', '. ogg', '.aif', '.aiff', '.dsf')
+def _list_audio_files(self):
+    """List all supported audio files in directory"""
+    supported_exts = {'.wav', '.aiff', '.aif', '.flac', '.mp3', '.m4a', '.aac', '.dsf'}
+    files = []
     try:
-        files = []
-        for f in os.listdir(directory):
-            if f.startswith('._'):
-                continue
-            if f.lower().endswith(audio_ext):
+        for f in sorted(os.listdir(self.audio_dir)):
+            # ✅ DOTFILE FILTER v4.6.6
+            if f.startswith('.'):
+                continue  # Skip macOS ._ files!
+            
+            if os.path.splitext(f)[1].lower() in supported_exts:
                 files.append(f)
-        return sorted(files)
     except Exception as e:
-        print("Directory error:", e)
-        return []
+        if self.debug:
+            print(f"[USBEngine] Error listing files: {e}")
+    return files
+
 
 # =====================================================================
 # SECTION 10: Interactive UI (v4.6.1 + v4.6.2 format display + USB mode switching)
@@ -2689,7 +2621,21 @@ Examples:
         
         print("[Shutdown] Clean exit")
 
+def list_audio_files(directory):
+    """Global audio file lister mit Dotfile-Filter"""
+    supported_exts = {'.wav', '.aiff', '.aif', '.flac', '.mp3', '.m4a', '.aac', '.dsf'}
+    files = []
+    try:
+        for f in sorted(os.listdir(directory)):
+            if f.startswith('.'):  # Skip macOS ._ files!
+                continue
+            if os.path.splitext(f)[1].lower() in supported_exts:
+                files.append(f)
+    except Exception as e:
+        print(f"[ERROR] Cannot list {directory}: {e}")
+        return []
+    return files
+
 
 if __name__ == "__main__":
     main()
-
