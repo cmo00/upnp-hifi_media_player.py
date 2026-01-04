@@ -9,12 +9,12 @@ Ultimate HiFi Audio Player v4.6.3 - Multi-Format + USB-DAC Support
 
 NEW FEATURES in v4.6.3:
 ✓ USB-DAC Direct Playback (soundfile-based, future-proof, NO aifc)
-✓ Auto-Detection of iFi & Compatible USB DACs
+✓ Auto-Detection of Compatible USB DACs
 ✓ Mode Switching (UPnP Network ↔ USB Direct)
 ✓ Device Selection & Configuration
 ✓ Fallback Support (UPnP→USB when renderer unavailable)
 ✓ All v4.6.2 Features Preserved:
-  - Multi-Format Support (MP3, FLAC, WAV, AIFF, M4A, DSF)
+  - Multi-Format Support (MP3, FLAC, WAV, AIFF)
   - Intelligente Format-Erkennung
   - DIDL-Lite Metadaten mit Format-spezifischen protocolInfo-Varianten
   - Optionale Metadaten-Extraktion mit mutagen (ID3, MP4, Vorbis)
@@ -214,12 +214,12 @@ class USBPlaybackEngine:
             device_idx: sounddevice device index for USB DAC
             debug: Enable debug logging
         """
-        self.audio_dir = audio_dir
+        self. audio_dir = audio_dir
         self.device_idx = device_idx
         self.debug = debug
         
-        # Scan audio files
-        self.files = list_audio_files(self.audio_dir)
+        # Scan audio files - NOW WITH PROPER TRACK SORTING!
+        self.files = list_audio_files(self. audio_dir, debug=debug)
         if not self.files:
             raise ValueError(f"No audio files found in {audio_dir}")
         
@@ -1995,22 +1995,113 @@ def get_lan_advertise_ip(fallback='127.0.0.1'):
     except Exception:
         return fallback
 
-def _list_audio_files(self):
-    """List all supported audio files in directory"""
-    supported_exts = {'.wav', '.aiff', '.aif', '.flac', '.mp3', '.m4a', '.aac', '.dsf'}
-    files = []
+# =====================================================================
+# SECTION 9. 5: Audio File Listing (FIXED - with proper track sorting)
+# =====================================================================
+
+def extract_track_number(filepath, debug=False):
+    """
+    Extract track number from audio file. 
+    Priority: 1) Metadata tags,  2) Filename parsing
+    Returns: int (1-based track number) or None
+    """
+    basename = os.path.basename(filepath)
+    
+    # Method 1: Try metadata (mutagen)
+    if MUTAGEN_SUPPORT:
+        try: 
+            audio = mutagen.File(filepath, easy=True)
+            if audio: 
+                # MP3, FLAC, M4A metadata tags
+                for tag_key in ['tracknumber', 'TRCK', 'TRK']: 
+                    tags = audio.get(tag_key)
+                    if tags:
+                        # Handle "5/12" or just "5"
+                        track_str = str(tags[0]).split('/')[0].strip()
+                        try:
+                            num = int(track_str)
+                            if debug:
+                                print(f"[TRACK-META] {basename} -> #{num}")
+                            return num
+                        except (ValueError, IndexError):
+                            pass
+        except Exception: 
+            pass
+    
+    # Method 2: Parse filename  
+    # Patterns: "01 - Title", "7 Song", "15_Track", etc.
+    import re
+    match = re.match(r'^(\d+)[\s_\-\.  :\)]+', basename)
+    if match:
+        try:
+            num = int(match.group(1))
+            if debug:
+                print(f"[TRACK-FILE] {basename} -> #{num}")
+            return num
+        except ValueError:
+            pass
+    
+    if debug:
+        print(f"[TRACK-NONE] {basename} -> NO TRACK NUMBER")
+    return None
+
+
+def list_audio_files(directory, debug=False):
+    """
+    List audio files sorted by track number.
+    
+    GUARANTEED to return files in correct playback order.
+    Files with track numbers come first (sorted numerically).
+    Files without track numbers come last (sorted alphabetically).
+    """
+    supported_exts = {'.wav', '.aiff', '.aif', '.flac', '.mp3', '.m4a', '. aac', '.dsf'}
+    
+    # Collect all audio files with track numbers
+    entries = []
+    
     try:
-        for f in sorted(os.listdir(self.audio_dir)):
-            # ✅ DOTFILE FILTER v4.6.6
-            if f.startswith('.'):
-                continue  # Skip macOS ._ files!
+        for filename in os.listdir(directory):
+            # Skip hidden files (macOS, etc.)
+            if filename.startswith('.'):
+                continue
             
-            if os.path.splitext(f)[1].lower() in supported_exts:
-                files.append(f)
+            # Check extension
+            ext = os.path. splitext(filename)[1].lower()
+            if ext not in supported_exts:
+                continue
+            
+            # Extract track number
+            filepath = os.path.join(directory, filename)
+            track_num = extract_track_number(filepath, debug=debug)
+            
+            # Store with sort key
+            if track_num is not None: 
+                sort_priority = (0, track_num, filename)  # 0 = has track number
+            else:
+                sort_priority = (1, 99999, filename)      # 1 = no track number
+            
+            entries.append((filename, sort_priority))
+    
     except Exception as e:
-        if self.debug:
-            print(f"[USBEngine] Error listing files: {e}")
-    return files
+        print(f"[ERROR] list_audio_files: {e}")
+        return []
+    
+    # Sort entries
+    entries.sort(key=lambda x: x[1])
+    
+    # Extract filenames in sorted order
+    sorted_files = [filename for filename, _ in entries]
+    
+    # Debug output
+    if debug:
+        print(f"\n[LIST-AUDIO] Sorted {len(sorted_files)} files:\n")
+        for i, f in enumerate(sorted_files, 1):
+            tn = extract_track_number(os.path.join(directory, f), debug=False)
+            tn_str = f"#{tn}" if tn else "? ?"
+            print(f"  {i:2d}.  {tn_str: >4s}  {f}")
+        print()
+    
+    return sorted_files
 
 
 # =====================================================================
@@ -2021,7 +2112,7 @@ def interactive_ui(files, polling_thread, command_worker, debug=False):
     print(f"\n{'='*80}")
     print("ULTIMATE HIFI AUDIO PLAYER v4.6.3 - Multi-Format + USB Support")
     print(f"{'='*80}")
-    print("Threading: Command Queue + 970ms Polling (Wireshark-validated)")
+    print("Threading:  Command Queue + 970ms Polling (Wireshark-validated)")
     print("Formats: WAV, AIFF, MP3, FLAC, M4A, DSF")
     print("Modes: UPnP Network + USB Direct")
     if USB_DEVICES_QUERYABLE:
@@ -2030,21 +2121,20 @@ def interactive_ui(files, polling_thread, command_worker, debug=False):
         print("✗ USB Detection Not Available")
     print(f"{'='*80}\n")
 
-    SHARED_STATE.set('total_tracks', len(files))
+    SHARED_STATE. set('total_tracks', len(files))
 
     while True:
         state = SHARED_STATE.get_all()
-        playback_mode = state. get('playback_mode', PlaybackMode.UPNP_NETWORK)
+        playback_mode = state.get('playback_mode', PlaybackMode.UPNP_NETWORK)
 
         print(f"\n{'='*80}")
-        print("AVAILABLE TRACKS")
+        print("AVAILABLE TRACKS (Album Order)")
         print(f"{'='*80}")
 
+        # Display all tracks in their playback order (files are pre-sorted)
         for i, f in enumerate(files):
-            if i == state['current_track_idx'] and state['is_playing']:
-                prefix = "▶"
-            else:
-                prefix = " "
+            is_current = (i == state['current_track_idx'] and state['is_playing'])
+            prefix = "▶" if is_current else " "
             
             fmt = get_format_from_extension(f).upper() if get_format_from_extension(f) else "?"
             print(f"{prefix} {i+1:2d}. {f:<50} [{fmt}]")
@@ -2065,7 +2155,7 @@ def interactive_ui(files, polling_thread, command_worker, debug=False):
             else:
                 pos = state['position']
                 dur = state['duration']
-                print(f"▶ Playing: {state['current_track_name']}")
+                print(f"▶ Playing:  {state['current_track_name']}")
 
                 if state['play_all_enabled']:
                     start_idx = state['play_all_start_idx']
@@ -2073,11 +2163,11 @@ def interactive_ui(files, polling_thread, command_worker, debug=False):
                 else:
                     print(f" Mode: Single Track")
 
-                print(f" Position: {int(pos//60)}:{int(pos%60):02d} / {int(dur//60)}:{int(dur%60):02d}")
+                print(f" Position:  {int(pos//60)}:{int(pos%60):02d} / {int(dur//60)}:{int(dur%60):02d}")
         else:
             print(f"⸸ State: {state['transport_state']}")
 
-        if state['error']:
+        if state['error']: 
             print(f"✗ Error: {state['error']}")
             SHARED_STATE.set('error', None)
 
@@ -2085,9 +2175,9 @@ def interactive_ui(files, polling_thread, command_worker, debug=False):
         print("COMMANDS")
         print(f"{'='*80}")
         print(f"1-{len(files)}: Play single track")
-        print(f"a: Play All from track (sequential)")
+        print(f"a:  Play All from track (sequential)")
         print(f"p: Play/Resume | s: Stop | n: Next | b: Previous")
-        if USB_DEVICES_QUERYABLE:
+        if USB_DEVICES_QUERYABLE: 
             print(f"m: Toggle Mode (USB ↔ UPnP)")
             print(f"d: Select USB Device")
         print(f"q: Quit")
@@ -2141,7 +2231,7 @@ def interactive_ui(files, polling_thread, command_worker, debug=False):
                 print(f"    {dac['channels']}ch @ {dac['sample_rate']}Hz ({dac['hostapi']})")
             
             sel = input("\nSelect device index (or Enter for auto): ").strip()
-            if sel.isdigit():
+            if sel. isdigit():
                 idx = int(sel)
                 if any(d['index'] == idx for d in dacs):
                     selected_dac = next(d for d in dacs if d['index'] == idx)
@@ -2149,7 +2239,7 @@ def interactive_ui(files, polling_thread, command_worker, debug=False):
                         'usb_device_index': idx,
                         'usb_device_name': selected_dac['name']
                     })
-                    print(f"✓ Selected: {selected_dac['name']}")
+                    print(f"✓ Selected:  {selected_dac['name']}")
                 else:
                     print("✗ Invalid device index")
             else:
@@ -2175,12 +2265,11 @@ def interactive_ui(files, polling_thread, command_worker, debug=False):
                         'track_started': False,
                         'track_start_time': 0
                     })
-                    # MUST send PLAY command, not SET_TRACK!
                     COMMAND_QUEUE.put(Command(CommandType.PLAY, {'track_idx': start_idx}))
-                    print(f"â–¶ Starting Play All from track {start_idx+1}")
+                    print(f"▶ Starting Play All from track {start_idx+1}")
                 else:
                     print("Invalid track number")
-            except ValueError:
+            except ValueError: 
                 print("Invalid input")
 
         elif choice == 'p':
@@ -2188,42 +2277,31 @@ def interactive_ui(files, polling_thread, command_worker, debug=False):
             COMMAND_QUEUE.put(Command(CommandType.PLAY, {'track_idx': current_idx}))
 
         elif choice == 'n':
-            # Next track command
             playback_mode = state.get('playback_mode', PlaybackMode.UPNP_NETWORK)
-            
             if state['current_track_idx'] < len(files) - 1:
                 COMMAND_QUEUE.put(Command(CommandType.NEXT))
                 if playback_mode == PlaybackMode.USB_DIRECT:
-                    print(f"â–¶ Next: {files[state['current_track_idx'] + 1]}")
+                    print(f"▶ Next:  {files[state['current_track_idx'] + 1]}")
                 else:
-                    print("â–¶ Next")
+                    print("▶ Next")
             else:
                 print("Already at last track")
         
         elif choice == 'b':
-            # Previous track command
             playback_mode = state.get('playback_mode', PlaybackMode.UPNP_NETWORK)
-            
             if state['current_track_idx'] > 0:
-                COMMAND_QUEUE.put(Command(CommandType.PREVIOUS))
+                COMMAND_QUEUE. put(Command(CommandType. PREVIOUS))
                 if playback_mode == PlaybackMode.USB_DIRECT:
-                    print(f"â–¶ Previous: {files[state['current_track_idx'] - 1]}")
+                    print(f"▶ Previous: {files[state['current_track_idx'] - 1]}")
                 else:
-                    print("â–¶ Previous")
+                    print("▶ Previous")
             else:
                 print("Already at first track")
         
         elif choice == 's':
-            # Stop command
-            playback_mode = state.get('playback_mode', PlaybackMode.UPNP_NETWORK)
-            
             SHARED_STATE.set('play_all_enabled', False)
             COMMAND_QUEUE.put(Command(CommandType.STOP))
-            
-            if playback_mode == PlaybackMode.USB_DIRECT:
-                print("â¹ Stopping USB playback")
-            else:
-                print("â¹ Stopping")
+            print("⏹ Stopping")
 
         else:
             try:
@@ -2233,27 +2311,27 @@ def interactive_ui(files, polling_thread, command_worker, debug=False):
                     COMMAND_QUEUE.put(Command(CommandType.SET_TRACK, {'track_idx': sel - 1}))
                 else:
                     print("Invalid track number")
-            except ValueError:
+            except ValueError: 
                 print("Invalid command")
 
 def interactive_ui_usb(usb_engine, debug=False):
     """
-    Interactive UI for USB playback mode.
+    Interactive UI for USB playback mode. 
     
-    This is the USB equivalent to interactive_ui() for UPnP mode.
-    Completely separate implementation with its own event loop.
+    Files are pre-sorted by track number (via list_audio_files),
+    so display order matches playback order automatically.
     """
     files = usb_engine.get_state()['files']
     
     def get_format_label(filename):
         """Get audio format for display"""
-        ext = os.path.splitext(filename)[1].lower()
+        ext = os. path.splitext(filename)[1].lower()
         ext_map = {
-            '.mp3': 'MP3', '.m4a': 'M4A', '.aac': 'AAC',
-            '.flac': 'FLAC', '.dsf': 'DSF', '.wav': 'WAV',
+            '. mp3': 'MP3', '.m4a': 'M4A', '.aac': 'AAC',
+            '.flac': 'FLAC', '.dsf': 'DSF', '. wav': 'WAV',
             '.aif': 'AIFF', '.aiff': 'AIFF'
         }
-        return ext_map.get(ext, '?')
+        return ext_map.get(ext, '? ')
     
     try:
         while True:
@@ -2267,48 +2345,51 @@ def interactive_ui_usb(usb_engine, debug=False):
             print("ULTIMATE HIFI AUDIO PLAYER v4.6.3 - USB Direct Mode")
             print(f"{'='*80}\n")
             
-            # Track list
+            # Track list (files already sorted by track number)
             print(f"{'='*80}")
-            print("AVAILABLE TRACKS")
+            print("AVAILABLE TRACKS (Album Order)")
             print(f"{'='*80}")
             for i, f in enumerate(files, 1):
-                marker = "▶ " if i == state['current_track_idx'] + 1 else "   "
+                is_current = (i - 1 == state['current_track_idx'] and state['is_playing'])
+                marker = "▶ " if is_current else "   "
                 fmt = get_format_label(f)
-                print(f"{marker}{i:2}. {f:<50} [{fmt}]")
+                print(f"{marker}{i:2d}. {f: <50} [{fmt}]")
             
             # Status
             print(f"\n{'='*80}")
             print("STATUS")
             print(f"{'='*80}")
-            print(f"Device: {state.get('device', 'iFi Pro iDSD')}")
+            print(f"Device: {state. get('device', 'USB Audio Device')}")
             
             if state['is_playing']:
                 pos_m, pos_s = divmod(int(state['position']), 60)
                 dur_m, dur_s = divmod(int(state['duration']), 60)
                 print(f"⏵ PLAYING")
-                print(f"▶ {state['track_name']}")
-                print(f"  Position: {pos_m}:{pos_s:02d} / {dur_m}:{dur_s:02d}")
-            elif state['is_paused']:
+                print(f"▶ {state['track_name']} (Track {state['current_track_idx'] + 1}/{len(files)})")
+                print(f"  Position: {pos_m}:{pos_s: 02d} / {dur_m}:{dur_s:02d}")
+            elif state['is_paused']: 
                 print(f"⏸ PAUSED")
                 print(f"▶ {state['track_name']}")
             else:
                 print(f"⏹ STOPPED")
             
-            if state['play_all']:
-                print(f"  Mode: Play All")
+            if state['play_all']: 
+                print(f"  Mode: Play All (Sequential)")
+            else:
+                print(f"  Mode: Single Track")
             
             # Commands
             print(f"\n{'='*80}")
             print("COMMANDS")
             print(f"{'='*80}")
-            print("1-N: Play single track")
-            print("a: Play All from track (sequential)")
-            print("p: Play/Pause | s: Stop | n: Next | b: Previous")
-            print("q: Quit")
+            print(f"1-{len(files)}: Play single track")
+            print(f"a:  Play All from track (sequential)")
+            print(f"p: Play/Pause | s: Stop | n: Next | b: Previous")
+            print(f"q:  Quit")
             print(f"{'='*80}\n")
             
             # Read command
-            choice = input("Command: ").strip().lower()
+            choice = input("Command:  ").strip().lower()
             
             if not choice:
                 continue
@@ -2328,7 +2409,7 @@ def interactive_ui_usb(usb_engine, debug=False):
                     if 0 <= start_idx < len(files):
                         print(f"▶ Starting Play All from track {start_idx + 1}")
                         usb_engine.enqueue_command(
-                            USBCommandType.PLAY_ALL,
+                            USBCommandType. PLAY_ALL,
                             start_idx=start_idx
                         )
                     else:
@@ -2347,29 +2428,31 @@ def interactive_ui_usb(usb_engine, debug=False):
             
             elif choice == 's':
                 print("⏹ Stopping")
-                usb_engine.enqueue_command(USBCommandType.STOP)
+                usb_engine.enqueue_command(USBCommandType. STOP)
             
             elif choice == 'p':
                 state = usb_engine.get_state()
                 if state['is_playing']:
                     print("⏸ Pausing")
                     usb_engine.enqueue_command(USBCommandType.PAUSE)
-                elif state['is_paused']:
+                elif state['is_paused']: 
                     print("⏵ Resuming")
-                    usb_engine.enqueue_command(USBCommandType.PLAY)
+                    usb_engine.enqueue_command(USBCommandType. PLAY)
                 else:
                     if state['current_track_idx'] < len(files):
                         print("▶ Playing")
                         usb_engine.enqueue_command(USBCommandType.PLAY)
             
             else:
-                try:
+                try: 
                     track_num = int(choice)
                     if 1 <= track_num <= len(files):
-                        print(f"▶ Playing track {track_num}")
-                        usb_engine.enqueue_command(
-                            USBCommandType.PLAY,
-                            track_idx=track_num - 1
+                        # Track numbers are 1-based for display
+                        actual_idx = track_num - 1
+                        print(f"▶ Playing track {track_num}:  {files[actual_idx]}")
+                        usb_engine. enqueue_command(
+                            USBCommandType. PLAY,
+                            track_idx=actual_idx
                         )
                     else:
                         print("Invalid track number")
@@ -2379,7 +2462,7 @@ def interactive_ui_usb(usb_engine, debug=False):
             
             time.sleep(0.1)
     
-    except KeyboardInterrupt:
+    except KeyboardInterrupt: 
         print("\n\nInterrupted by user")
                 
 
@@ -2621,20 +2704,7 @@ Examples:
         
         print("[Shutdown] Clean exit")
 
-def list_audio_files(directory):
-    """Global audio file lister mit Dotfile-Filter"""
-    supported_exts = {'.wav', '.aiff', '.aif', '.flac', '.mp3', '.m4a', '.aac', '.dsf'}
-    files = []
-    try:
-        for f in sorted(os.listdir(directory)):
-            if f.startswith('.'):  # Skip macOS ._ files!
-                continue
-            if os.path.splitext(f)[1].lower() in supported_exts:
-                files.append(f)
-    except Exception as e:
-        print(f"[ERROR] Cannot list {directory}: {e}")
-        return []
-    return files
+
 
 
 if __name__ == "__main__":
