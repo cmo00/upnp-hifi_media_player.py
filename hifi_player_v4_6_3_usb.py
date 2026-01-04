@@ -2529,7 +2529,7 @@ Examples:
     print("HIFI AUDIO PLAYER v4.6.3 - MULTI-FORMAT + USB SUPPORT")
     print(f"{'='*80}")
     print("Architecture: Command Queue + 970ms Polling (Wireshark)")
-    print("Formats: WAV, AIFF, MP3, FLAC, M4A, DSF")
+    print("Formats: WAV, AIFF, MP3, FLAC")
     print("Modes: UPnP Network + USB Direct")
     print(f"{'='*80}\n")
     
